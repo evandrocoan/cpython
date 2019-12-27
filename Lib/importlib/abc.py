@@ -10,7 +10,7 @@ except ImportError as exc:
     _frozen_importlib = None
 try:
     import _frozen_importlib_external
-except ImportError as exc:
+except ImportError:
     _frozen_importlib_external = _bootstrap_external
 import abc
 import warnings
@@ -66,7 +66,7 @@ class MetaPathFinder(Finder):
 
         """
         warnings.warn("MetaPathFinder.find_module() is deprecated since Python "
-                      "3.4 in favor of MetaPathFinder.find_spec()"
+                      "3.4 in favor of MetaPathFinder.find_spec() "
                       "(available since 3.4)",
                       DeprecationWarning,
                       stacklevel=2)
@@ -342,7 +342,7 @@ class SourceLoader(_bootstrap_external.SourceLoader, ResourceLoader, ExecutionLo
 _register(SourceLoader, machinery.SourceFileLoader)
 
 
-class ResourceReader:
+class ResourceReader(metaclass=abc.ABCMeta):
 
     """Abstract base class to provide resource-reading support.
 
@@ -381,5 +381,8 @@ class ResourceReader:
 
     @abc.abstractmethod
     def contents(self):
-        """Return an iterator of strings over the contents of the package."""
-        return iter([])
+        """Return an iterable of strings over the contents of the package."""
+        return []
+
+
+_register(ResourceReader, machinery.SourceFileLoader)

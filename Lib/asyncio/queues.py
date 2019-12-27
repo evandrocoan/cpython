@@ -2,6 +2,7 @@ __all__ = ('Queue', 'PriorityQueue', 'LifoQueue', 'QueueFull', 'QueueEmpty')
 
 import collections
 import heapq
+import warnings
 
 from . import events
 from . import locks
@@ -34,6 +35,9 @@ class Queue:
             self._loop = events.get_event_loop()
         else:
             self._loop = loop
+            warnings.warn("The loop argument is deprecated since Python 3.8, "
+                          "and scheduled for removal in Python 3.10.",
+                          DeprecationWarning, stacklevel=2)
         self._maxsize = maxsize
 
         # Futures.
@@ -41,7 +45,7 @@ class Queue:
         # Futures.
         self._putters = collections.deque()
         self._unfinished_tasks = 0
-        self._finished = locks.Event(loop=self._loop)
+        self._finished = locks.Event(loop=loop)
         self._finished.set()
         self._init(maxsize)
 
@@ -71,6 +75,9 @@ class Queue:
 
     def __str__(self):
         return f'<{type(self).__name__} {self._format()}>'
+
+    def __class_getitem__(cls, type):
+        return cls
 
     def _format(self):
         result = f'maxsize={self._maxsize!r}'
@@ -121,6 +128,13 @@ class Queue:
                 await putter
             except:
                 putter.cancel()  # Just in case putter is not done yet.
+                try:
+                    # Clean self._putters from canceled putters.
+                    self._putters.remove(putter)
+                except ValueError:
+                    # The putter could be removed from self._putters by a
+                    # previous get_nowait call.
+                    pass
                 if not self.full() and not putter.cancelled():
                     # We were woken up by get_nowait(), but can't take
                     # the call.  Wake up the next in line.
@@ -152,12 +166,13 @@ class Queue:
                 await getter
             except:
                 getter.cancel()  # Just in case getter is not done yet.
-
                 try:
+                    # Clean self._getters from canceled getters.
                     self._getters.remove(getter)
                 except ValueError:
+                    # The getter could be removed from self._getters by a
+                    # previous put_nowait call.
                     pass
-
                 if not self.empty() and not getter.cancelled():
                     # We were woken up by put_nowait(), but can't take
                     # the call.  Wake up the next in line.

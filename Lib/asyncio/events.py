@@ -11,6 +11,7 @@ __all__ = (
     '_get_running_loop',
 )
 
+import contextvars
 import os
 import socket
 import subprocess
@@ -18,15 +19,20 @@ import sys
 import threading
 
 from . import format_helpers
+from . import exceptions
 
 
 class Handle:
     """Object returned by callback registration methods."""
 
     __slots__ = ('_callback', '_args', '_cancelled', '_loop',
-                 '_source_traceback', '_repr', '__weakref__')
+                 '_source_traceback', '_repr', '__weakref__',
+                 '_context')
 
-    def __init__(self, callback, args, loop):
+    def __init__(self, callback, args, loop, context=None):
+        if context is None:
+            context = contextvars.copy_context()
+        self._context = context
         self._loop = loop
         self._callback = callback
         self._args = args
@@ -72,8 +78,10 @@ class Handle:
 
     def _run(self):
         try:
-            self._callback(*self._args)
-        except Exception as exc:
+            self._context.run(self._callback, *self._args)
+        except (SystemExit, KeyboardInterrupt):
+            raise
+        except BaseException as exc:
             cb = format_helpers._format_callback_source(
                 self._callback, self._args)
             msg = f'Exception in callback {cb}'
@@ -93,9 +101,9 @@ class TimerHandle(Handle):
 
     __slots__ = ['_scheduled', '_when']
 
-    def __init__(self, when, callback, args, loop):
+    def __init__(self, when, callback, args, loop, context=None):
         assert when is not None
-        super().__init__(callback, args, loop)
+        super().__init__(callback, args, loop, context)
         if self._source_traceback:
             del self._source_traceback[-1]
         self._when = when
@@ -111,20 +119,24 @@ class TimerHandle(Handle):
         return hash(self._when)
 
     def __lt__(self, other):
-        return self._when < other._when
+        if isinstance(other, TimerHandle):
+            return self._when < other._when
+        return NotImplemented
 
     def __le__(self, other):
-        if self._when < other._when:
-            return True
-        return self.__eq__(other)
+        if isinstance(other, TimerHandle):
+            return self._when < other._when or self.__eq__(other)
+        return NotImplemented
 
     def __gt__(self, other):
-        return self._when > other._when
+        if isinstance(other, TimerHandle):
+            return self._when > other._when
+        return NotImplemented
 
     def __ge__(self, other):
-        if self._when > other._when:
-            return True
-        return self.__eq__(other)
+        if isinstance(other, TimerHandle):
+            return self._when > other._when or self.__eq__(other)
+        return NotImplemented
 
     def __eq__(self, other):
         if isinstance(other, TimerHandle):
@@ -134,14 +146,18 @@ class TimerHandle(Handle):
                     self._cancelled == other._cancelled)
         return NotImplemented
 
-    def __ne__(self, other):
-        equal = self.__eq__(other)
-        return NotImplemented if equal is NotImplemented else not equal
-
     def cancel(self):
         if not self._cancelled:
             self._loop._timer_handle_cancelled(self)
         super().cancel()
+
+    def when(self):
+        """Return a scheduled callback time.
+
+        The time is an absolute timestamp, using the same time
+        reference as loop.time().
+        """
+        return self._when
 
 
 class AbstractServer:
@@ -151,13 +167,39 @@ class AbstractServer:
         """Stop serving.  This leaves existing connections open."""
         raise NotImplementedError
 
+    def get_loop(self):
+        """Get the event loop the Server object is attached to."""
+        raise NotImplementedError
+
+    def is_serving(self):
+        """Return True if the server is accepting connections."""
+        raise NotImplementedError
+
+    async def start_serving(self):
+        """Start accepting connections.
+
+        This method is idempotent, so it can be called when
+        the server is already being serving.
+        """
+        raise NotImplementedError
+
+    async def serve_forever(self):
+        """Start accepting connections until the coroutine is cancelled.
+
+        The server is closed when the coroutine is cancelled.
+        """
+        raise NotImplementedError
+
     async def wait_closed(self):
         """Coroutine to wait until service is closed."""
         raise NotImplementedError
 
-    def get_loop(self):
-        """ Get the event loop the Server object is attached to."""
-        raise NotImplementedError
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        self.close()
+        await self.wait_closed()
 
 
 class AbstractEventLoop:
@@ -207,6 +249,10 @@ class AbstractEventLoop:
         """Shutdown all active asynchronous generators."""
         raise NotImplementedError
 
+    async def shutdown_default_executor(self):
+        """Schedule the shutdown of the default executor."""
+        raise NotImplementedError
+
     # Methods scheduling callbacks.  All these return Handles.
 
     def _timer_handle_cancelled(self, handle):
@@ -230,7 +276,7 @@ class AbstractEventLoop:
 
     # Method scheduling a coroutine object: create a task.
 
-    def create_task(self, coro):
+    def create_task(self, coro, *, name=None):
         raise NotImplementedError
 
     # Methods for interacting with threads.
@@ -258,7 +304,8 @@ class AbstractEventLoop:
             *, ssl=None, family=0, proto=0,
             flags=0, sock=None, local_addr=None,
             server_hostname=None,
-            ssl_handshake_timeout=None):
+            ssl_handshake_timeout=None,
+            happy_eyeballs_delay=None, interleave=None):
         raise NotImplementedError
 
     async def create_server(
@@ -266,7 +313,8 @@ class AbstractEventLoop:
             *, family=socket.AF_UNSPEC,
             flags=socket.AI_PASSIVE, sock=None, backlog=100,
             ssl=None, reuse_address=None, reuse_port=None,
-            ssl_handshake_timeout=None):
+            ssl_handshake_timeout=None,
+            start_serving=True):
         """A coroutine which creates a TCP server bound to host and port.
 
         The return value is a Server object which can be used to stop
@@ -304,8 +352,20 @@ class AbstractEventLoop:
 
         ssl_handshake_timeout is the time in seconds that an SSL server
         will wait for completion of the SSL handshake before aborting the
-        connection. Default is 10s, longer timeouts may increase vulnerability
-        to DoS attacks (see https://support.f5.com/csp/article/K13834)
+        connection. Default is 60s.
+
+        start_serving set to True (default) causes the created server
+        to start accepting connections immediately.  When set to False,
+        the user should await Server.start_serving() or Server.serve_forever()
+        to make the server to start accepting connections.
+        """
+        raise NotImplementedError
+
+    async def sendfile(self, transport, file, offset=0, count=None,
+                       *, fallback=True):
+        """Send a file through a transport.
+
+        Return an amount of sent bytes.
         """
         raise NotImplementedError
 
@@ -330,7 +390,8 @@ class AbstractEventLoop:
     async def create_unix_server(
             self, protocol_factory, path=None, *,
             sock=None, backlog=100, ssl=None,
-            ssl_handshake_timeout=None):
+            ssl_handshake_timeout=None,
+            start_serving=True):
         """A coroutine which creates a UNIX Domain Socket server.
 
         The return value is a Server object, which can be used to stop
@@ -349,7 +410,12 @@ class AbstractEventLoop:
         accepted connections.
 
         ssl_handshake_timeout is the time in seconds that an SSL server
-        will wait for the SSL handshake to complete (defaults to 10s).
+        will wait for the SSL handshake to complete (defaults to 60s).
+
+        start_serving set to True (default) causes the created server
+        to start accepting connections immediately.  When set to False,
+        the user should await Server.start_serving() or Server.serve_forever()
+        to make the server to start accepting connections.
         """
         raise NotImplementedError
 
@@ -464,6 +530,10 @@ class AbstractEventLoop:
     async def sock_accept(self, sock):
         raise NotImplementedError
 
+    async def sock_sendfile(self, sock, file, offset=0, count=None,
+                            *, fallback=None):
+        raise NotImplementedError
+
     # Signal handling.
 
     def add_signal_handler(self, sig, callback, *args):
@@ -560,13 +630,13 @@ class BaseDefaultEventLoopPolicy(AbstractEventLoopPolicy):
         self._local = self._Local()
 
     def get_event_loop(self):
-        """Get the event loop.
+        """Get the event loop for the current context.
 
-        This may be None or an instance of EventLoop.
+        Returns an instance of EventLoop or raises an exception.
         """
         if (self._local._loop is None and
                 not self._local._set_called and
-                isinstance(threading.current_thread(), threading._MainThread)):
+                threading.current_thread() is threading.main_thread()):
             self.set_event_loop(self.new_event_loop())
 
         if self._local._loop is None:

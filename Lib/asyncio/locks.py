@@ -3,11 +3,13 @@
 __all__ = ('Lock', 'Event', 'Condition', 'Semaphore', 'BoundedSemaphore')
 
 import collections
+import types
 import warnings
 
 from . import events
 from . import futures
-from .coroutines import coroutine
+from . import exceptions
+from .import coroutines
 
 
 class _ContextManager:
@@ -54,7 +56,7 @@ class _ContextManagerMixin:
         # always raises; that's how the with-statement works.
         pass
 
-    @coroutine
+    @types.coroutine
     def __iter__(self):
         # This is not a coroutine.  It is meant to enable the idiom:
         #
@@ -76,6 +78,9 @@ class _ContextManagerMixin:
                       DeprecationWarning, stacklevel=2)
         yield from self.acquire()
         return _ContextManager(self)
+
+    # The flag is needed for legacy asyncio.iscoroutine()
+    __iter__._is_coroutine = coroutines._is_coroutine
 
     async def __acquire_ctx(self):
         await self.acquire()
@@ -153,12 +158,15 @@ class Lock(_ContextManagerMixin):
     """
 
     def __init__(self, *, loop=None):
-        self._waiters = collections.deque()
+        self._waiters = None
         self._locked = False
-        if loop is not None:
-            self._loop = loop
-        else:
+        if loop is None:
             self._loop = events.get_event_loop()
+        else:
+            self._loop = loop
+            warnings.warn("The loop argument is deprecated since Python 3.8, "
+                          "and scheduled for removal in Python 3.10.",
+                          DeprecationWarning, stacklevel=2)
 
     def __repr__(self):
         res = super().__repr__()
@@ -177,22 +185,31 @@ class Lock(_ContextManagerMixin):
         This method blocks until the lock is unlocked, then sets it to
         locked and returns True.
         """
-        if not self._locked and all(w.cancelled() for w in self._waiters):
+        if (not self._locked and (self._waiters is None or
+                all(w.cancelled() for w in self._waiters))):
             self._locked = True
             return True
 
+        if self._waiters is None:
+            self._waiters = collections.deque()
         fut = self._loop.create_future()
         self._waiters.append(fut)
+
+        # Finally block should be called before the CancelledError
+        # handling as we don't want CancelledError to call
+        # _wake_up_first() and attempt to wake up itself.
         try:
-            await fut
-            self._locked = True
-            return True
-        except futures.CancelledError:
+            try:
+                await fut
+            finally:
+                self._waiters.remove(fut)
+        except exceptions.CancelledError:
             if not self._locked:
                 self._wake_up_first()
             raise
-        finally:
-            self._waiters.remove(fut)
+
+        self._locked = True
+        return True
 
     def release(self):
         """Release a lock.
@@ -212,11 +229,19 @@ class Lock(_ContextManagerMixin):
             raise RuntimeError('Lock is not acquired.')
 
     def _wake_up_first(self):
-        """Wake up the first waiter who isn't cancelled."""
-        for fut in self._waiters:
-            if not fut.done():
-                fut.set_result(True)
-                break
+        """Wake up the first waiter if it isn't done."""
+        if not self._waiters:
+            return
+        try:
+            fut = next(iter(self._waiters))
+        except StopIteration:
+            return
+
+        # .done() necessarily means that a waiter will wake up later on and
+        # either take the lock, or, if it was cancelled and lock wasn't
+        # taken already, will hit this again and wake up a new waiter.
+        if not fut.done():
+            fut.set_result(True)
 
 
 class Event:
@@ -231,10 +256,13 @@ class Event:
     def __init__(self, *, loop=None):
         self._waiters = collections.deque()
         self._value = False
-        if loop is not None:
-            self._loop = loop
-        else:
+        if loop is None:
             self._loop = events.get_event_loop()
+        else:
+            self._loop = loop
+            warnings.warn("The loop argument is deprecated since Python 3.8, "
+                          "and scheduled for removal in Python 3.10.",
+                          DeprecationWarning, stacklevel=2)
 
     def __repr__(self):
         res = super().__repr__()
@@ -295,13 +323,16 @@ class Condition(_ContextManagerMixin):
     """
 
     def __init__(self, lock=None, *, loop=None):
-        if loop is not None:
-            self._loop = loop
-        else:
+        if loop is None:
             self._loop = events.get_event_loop()
+        else:
+            self._loop = loop
+            warnings.warn("The loop argument is deprecated since Python 3.8, "
+                          "and scheduled for removal in Python 3.10.",
+                          DeprecationWarning, stacklevel=2)
 
         if lock is None:
-            lock = Lock(loop=self._loop)
+            lock = Lock(loop=loop)
         elif lock._loop is not self._loop:
             raise ValueError("loop argument must agree with lock")
 
@@ -346,12 +377,16 @@ class Condition(_ContextManagerMixin):
 
         finally:
             # Must reacquire lock even if wait is cancelled
+            cancelled = False
             while True:
                 try:
                     await self.acquire()
                     break
-                except futures.CancelledError:
-                    pass
+                except exceptions.CancelledError:
+                    cancelled = True
+
+            if cancelled:
+                raise exceptions.CancelledError
 
     async def wait_for(self, predicate):
         """Wait until a predicate becomes true.
@@ -419,10 +454,13 @@ class Semaphore(_ContextManagerMixin):
             raise ValueError("Semaphore initial value must be >= 0")
         self._value = value
         self._waiters = collections.deque()
-        if loop is not None:
-            self._loop = loop
-        else:
+        if loop is None:
             self._loop = events.get_event_loop()
+        else:
+            self._loop = loop
+            warnings.warn("The loop argument is deprecated since Python 3.8, "
+                          "and scheduled for removal in Python 3.10.",
+                          DeprecationWarning, stacklevel=2)
 
     def __repr__(self):
         res = super().__repr__()
@@ -482,6 +520,11 @@ class BoundedSemaphore(Semaphore):
     """
 
     def __init__(self, value=1, *, loop=None):
+        if loop:
+            warnings.warn("The loop argument is deprecated since Python 3.8, "
+                          "and scheduled for removal in Python 3.10.",
+                          DeprecationWarning, stacklevel=2)
+
         self._bound_value = value
         super().__init__(value, loop=loop)
 

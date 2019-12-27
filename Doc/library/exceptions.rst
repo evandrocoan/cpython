@@ -52,7 +52,7 @@ will be set as :attr:`__cause__` on the raised exception. Setting
 :attr:`__cause__` also implicitly sets the :attr:`__suppress_context__`
 attribute to ``True``, so that using ``raise new_exc from None``
 effectively replaces the old exception with the new one for display
-purposes (e.g. converting :exc:`KeyError` to :exc:`AttributeError`, while
+purposes (e.g. converting :exc:`KeyError` to :exc:`AttributeError`), while
 leaving the old exception available in :attr:`__context__` for introspection
 when debugging.
 
@@ -367,17 +367,21 @@ The following exceptions are the exceptions that are usually raised.
    raised, and the value returned by the function is used as the
    :attr:`value` parameter to the constructor of the exception.
 
-   If a generator function defined in the presence of a ``from __future__
-   import generator_stop`` directive raises :exc:`StopIteration`, it will be
-   converted into a :exc:`RuntimeError` (retaining the :exc:`StopIteration`
-   as the new exception's cause).
+   If a generator code directly or indirectly raises :exc:`StopIteration`,
+   it is converted into a :exc:`RuntimeError` (retaining the
+   :exc:`StopIteration` as the new exception's cause).
 
    .. versionchanged:: 3.3
       Added ``value`` attribute and the ability for generator functions to
       use it to return a value.
 
    .. versionchanged:: 3.5
-      Introduced the RuntimeError transformation.
+      Introduced the RuntimeError transformation via
+      ``from __future__ import generator_stop``, see :pep:`479`.
+
+   .. versionchanged:: 3.7
+      Enable :pep:`479` for all code by default: a :exc:`StopIteration`
+      error raised in a generator is transformed into a :exc:`RuntimeError`.
 
 .. exception:: StopAsyncIteration
 
@@ -521,7 +525,7 @@ The following exceptions are the exceptions that are usually raised.
 
 .. exception:: ValueError
 
-   Raised when a built-in operation or function receives an argument that has the
+   Raised when an operation or function receives an argument that has the
    right type but an inappropriate value, and the situation is not described by a
    more precise exception such as :exc:`IndexError`.
 
@@ -687,8 +691,13 @@ The following exceptions are used as warning categories; see the
 
 .. exception:: PendingDeprecationWarning
 
-   Base class for warnings about features which will be deprecated in the
-   future.
+   Base class for warnings about features which are obsolete and
+   expected to be deprecated in the future, but are not deprecated
+   at the moment.
+
+   This class is rarely used as emitting a warning about a possible
+   upcoming deprecation is unusual, and :exc:`DeprecationWarning`
+   is preferred for already active deprecations.
 
 
 .. exception:: SyntaxWarning
